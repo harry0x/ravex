@@ -22,6 +22,8 @@ import { MessageHandler, type MessageHandlerConfig } from './handlers/MessageHan
 import { TypingHandler, type TypingConfig } from './handlers/TypingHandler.js'
 import { PresenceHandler, type PresenceConfig } from './handlers/PresenceHandler.js'
 import { ChatError, ErrorCodes } from './utils/errors.js'
+import { resolveUser, warnAuthConfig, AUTH_FAILED_MESSAGE, type Authenticate, type AuthOptions } from './middleware/Auth.js'
+import { logger } from './utils/logger.js'
 
 export interface SocketData {
   user: User
@@ -57,6 +59,18 @@ export interface ChatEngineOptions {
    * Ignored when an existing socket.io Server instance is passed as the first argument.
    */
   socket?: Partial<ServerOptions>
+  /**
+   * Verifies who is connecting, e.g. from a token in `handshake.auth` or a cookie in
+   * `handshake.headers`, and returns that user. Return null/undefined or throw to reject the connection.
+   * When set, the `auth.user` object sent by the client is ignored.
+   * Required in production: without it (and without `insecureTrustClientUser`) every connection is rejected.
+   */
+  authenticate?: Authenticate
+  /**
+   * Development only: trust the `auth.user` object sent by the client, so anyone can connect as any user.
+   * Ignored when `authenticate` is set. Default: false.
+   */
+  insecureTrustClientUser?: boolean
   persistence?: PersistenceAdapter
   messageMiddleware?: MessageMiddleware[]
   message?: MessageHandlerConfig
@@ -82,6 +96,7 @@ export class ChatEngine {
   private readonly presenceHandler: PresenceHandler
   private readonly persistence?: PersistenceAdapter
   private readonly middleware: MessageMiddleware[]
+  private readonly auth: AuthOptions
 
   /**
    * @param srv - An HTTP/HTTPS/HTTP2 server, a port number to listen on, or
@@ -95,6 +110,8 @@ export class ChatEngine {
     this.ns = this.server.of(nsPath) as TypedNamespace
     this.persistence = options.persistence
     this.middleware = options.messageMiddleware ?? []
+    this.auth = { authenticate: options.authenticate, insecureTrustClientUser: options.insecureTrustClientUser }
+    warnAuthConfig(this.auth)
     this.rateLimiter = new RateLimiter(options.rateLimit)
     this.messageHandler = new MessageHandler({
       ns: this.ns,
@@ -120,15 +137,19 @@ export class ChatEngine {
   }
 
   private setupConnection(): void {
-    // Populate socket.data.user from auth payload
+    // Decide who the connecting user is before any event handler can run
     this.ns.use((socket, next) => {
-      const user = socket.handshake.auth.user as User | undefined
-      if (user?.id) {
-        socket.data.user = user
-        next()
-      } else {
-        next(new Error('Authentication failed: Missing or invalid user in auth payload'))
-      }
+      resolveUser(socket.handshake, this.auth).then(
+        (user) => {
+          if (!user) return next(new Error(AUTH_FAILED_MESSAGE))
+          socket.data.user = user
+          next()
+        },
+        (err: unknown) => {
+          logger.warn('authenticate() threw, rejecting connection:', err)
+          next(new Error(AUTH_FAILED_MESSAGE))
+        },
+      )
     })
 
     this.ns.on('connection', (socket) => {
