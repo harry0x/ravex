@@ -22,7 +22,13 @@ const PAYLOADS = [
 ]
 
 const http = createServer()
-new ChatEngine(http, { presence: { heartbeat: false }, message: { allowEdits: true, allowDeletes: true } })
+// insecureTrustClientUser lets this test client connect with a plain auth.user
+// (servers reject unauthenticated connections by default once the authenticate option lands).
+new ChatEngine(http, {
+  insecureTrustClientUser: true,
+  presence: { heartbeat: false },
+  message: { allowEdits: true, allowDeletes: true },
+})
 await new Promise((resolve) => http.listen(0, resolve))
 
 const client = new ChatClient({
