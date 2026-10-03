@@ -170,6 +170,10 @@ export class ChatEngine {
         status: user.status || 'online',
         connectedAt: new Date(),
       })
+    } else if (!wasOnline) {
+      // Coming back after being fully disconnected (status was set to 'offline')
+      existing.status = user.status || 'online'
+      existing.connectedAt = new Date()
     }
     this.userManager.addSocketId(user.id, socketId)
     if (!wasOnline) {
@@ -184,6 +188,7 @@ export class ChatEngine {
       const lastSeen = new Date()
       if (user) {
         user.lastSeen = lastSeen
+        user.status = 'offline'
         this.userManager.set(userId, user)
       }
       this.ns.emit('user:offline', { id: userId, username, lastSeen })
@@ -203,7 +208,7 @@ export class ChatEngine {
       if (!wasMember) {
         this.roomManager.addMember(roomId, user.id)
       }
-      socket.join(roomId)
+      this.joinUserSockets(user.id, roomId)
       if (!wasMember) {
         this.ns.to(roomId).emit('room:user_joined', {
           roomId,
@@ -221,7 +226,7 @@ export class ChatEngine {
       const user = socket.data.user
       const { roomId } = data
       if (!roomId) throw new ChatError('roomId required', ErrorCodes.VALIDATION)
-      socket.leave(roomId)
+      this.leaveUserSockets(user.id, roomId)
       if (this.roomManager.isMember(roomId, user.id)) {
         this.roomManager.removeMember(roomId, user.id)
         this.ns.to(roomId).emit('room:user_left', {
@@ -293,6 +298,20 @@ export class ChatEngine {
     const user = socket.data.user
     const rooms = this.roomManager.getRoomsForUser(user.id)
     ack({ ok: true, data: rooms })
+  }
+
+  /** Subscribes every open tab (socket) of a user to a room, not just the one that asked. */
+  private joinUserSockets(userId: string, roomId: string): void {
+    for (const sid of this.userManager.get(userId)?.socketIds ?? []) {
+      this.ns.sockets.get(sid)?.join(roomId)
+    }
+  }
+
+  /** Unsubscribes every open tab (socket) of a user from a room. */
+  private leaveUserSockets(userId: string, roomId: string): void {
+    for (const sid of this.userManager.get(userId)?.socketIds ?? []) {
+      this.ns.sockets.get(sid)?.leave(roomId)
+    }
   }
 
   private sendAckError(ack: ErrorAck, err: unknown): void {
