@@ -11,17 +11,20 @@ export interface TypingConfig {
   typingThrottle?: number
 }
 
-interface TypingContext {
-  key: string
-  userId: string
+interface TypingState {
   username: string
-  roomId: string
+  /** The socket that last sent typing:start, so closing that tab clears it. */
+  socketId: string
+  lastEvent: number
+  timer: ReturnType<typeof setTimeout>
 }
 
+/** Per-user socket.io room every socket joins, so a user's own tabs can be excluded from broadcasts. */
+export const userRoom = (userId: string): string => `ravex:user:${userId}`
+
 export class TypingHandler {
-  // key: `${userId}:${roomId}`
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>()
-  private readonly lastEvent = new Map<string, number>()
+  // roomId -> userId -> state. Nested maps instead of `${userId}:${roomId}` keys so IDs may contain ':'.
+  private readonly typing = new Map<string, Map<string, TypingState>>()
 
   constructor(
     private readonly ns: TypedNamespace,
@@ -39,21 +42,26 @@ export class TypingHandler {
     const room = this.roomManager.get(roomId)
     if (!room || !room.members.includes(user.id)) return
 
-    const key = `${user.id}:${roomId}`
     const now = Date.now()
-
     const throttle = this.config.typingThrottle ?? DEFAULT_TYPING_THROTTLE_MS
-    const last = this.lastEvent.get(key) ?? 0
-    if (now - last < throttle) return
-    this.lastEvent.set(key, now)
+    const existing = this.typing.get(roomId)?.get(user.id)
+    if (existing && now - existing.lastEvent < throttle) return
 
-    socket.to(roomId).emit('typing:start', {
-      userId: user.id,
-      username: user.username,
-      roomId,
-    })
+    if (existing) clearTimeout(existing.timer)
+    const timeout = this.config.typingTimeout ?? DEFAULT_TYPING_TIMEOUT_MS
+    const timer = setTimeout(() => {
+      this.clear(roomId, user.id)
+      logger.debug(`Typing auto-cleared: ${user.id} in ${roomId}`)
+    }, timeout)
 
-    this.resetTimer({ key, userId: user.id, username: user.username, roomId }, socket)
+    let roomTyping = this.typing.get(roomId)
+    if (!roomTyping) {
+      roomTyping = new Map()
+      this.typing.set(roomId, roomTyping)
+    }
+    roomTyping.set(user.id, { username: user.username, socketId: socket.id, lastEvent: now, timer })
+
+    this.emit('typing:start', { userId: user.id, username: user.username, roomId })
     logger.debug(`Typing start: ${user.id} in ${roomId}`)
   }
 
@@ -64,53 +72,55 @@ export class TypingHandler {
     const { roomId } = data
     if (!roomId) return
 
-    this.clearTyping({ key: `${user.id}:${roomId}`, userId: user.id, username: user.username, roomId }, socket)
+    // Only users that are currently typing (and therefore passed the membership check) can stop.
+    this.clear(roomId, user.id)
   }
 
-  clearForRoom(userId: string, username: string, roomId: string): void {
-    const key = `${userId}:${roomId}`
-    if (this.timers.has(key)) {
-      clearTimeout(this.timers.get(key))
-      this.timers.delete(key)
-      this.lastEvent.delete(key)
-      this.ns.to(roomId).emit('typing:stop', { userId, username, roomId })
-    }
+  /** Clears a user's typing state in one room and notifies the room. No-op if they weren't typing. */
+  clearForRoom(userId: string, roomId: string): void {
+    this.clear(roomId, userId)
   }
 
-  clearAll(userId: string, username: string): void {
-    for (const [key] of this.timers) {
-      if (key.startsWith(`${userId}:`)) {
-        const roomId = key.split(':')[1]
-        clearTimeout(this.timers.get(key))
-        this.timers.delete(key)
-        this.lastEvent.delete(key)
-        this.ns.to(roomId).emit('typing:stop', { userId, username, roomId })
+  /** Clears typing started from a specific socket (e.g. when that tab disconnects). */
+  clearForSocket(socketId: string): void {
+    for (const [roomId, roomTyping] of this.typing) {
+      for (const [userId, state] of roomTyping) {
+        if (state.socketId === socketId) this.clear(roomId, userId)
       }
     }
   }
 
-  private clearTyping(ctx: TypingContext, socket: TypedSocket): void {
-    const { key, userId, username, roomId } = ctx
-    if (this.timers.has(key)) {
-      clearTimeout(this.timers.get(key))
-      this.timers.delete(key)
-      this.lastEvent.delete(key)
-    }
-    socket.to(roomId).emit('typing:stop', { userId, username, roomId })
+  /** Clears a user's typing state in every room. */
+  clearAll(userId: string): void {
+    for (const roomId of this.typing.keys()) this.clear(roomId, userId)
   }
 
-  private resetTimer(ctx: TypingContext, socket: TypedSocket): void {
-    const { key, userId, username, roomId } = ctx
-    if (this.timers.has(key)) clearTimeout(this.timers.get(key))
+  /** Drops all typing state for a deleted room without emitting. */
+  clearRoomSilently(roomId: string): void {
+    const roomTyping = this.typing.get(roomId)
+    if (!roomTyping) return
+    for (const state of roomTyping.values()) clearTimeout(state.timer)
+    this.typing.delete(roomId)
+  }
 
-    const timeout = this.config.typingTimeout ?? DEFAULT_TYPING_TIMEOUT_MS
-    const timer = setTimeout(() => {
-      this.timers.delete(key)
-      this.lastEvent.delete(key)
-      socket.to(roomId).emit('typing:stop', { userId, username, roomId })
-      logger.debug(`Typing auto-cleared: ${userId} in ${roomId}`)
-    }, timeout)
+  destroy(): void {
+    for (const roomId of [...this.typing.keys()]) this.clearRoomSilently(roomId)
+  }
 
-    this.timers.set(key, timer)
+  private clear(roomId: string, userId: string): void {
+    const roomTyping = this.typing.get(roomId)
+    const state = roomTyping?.get(userId)
+    if (!roomTyping || !state) return
+
+    clearTimeout(state.timer)
+    roomTyping.delete(userId)
+    if (roomTyping.size === 0) this.typing.delete(roomId)
+
+    this.emit('typing:stop', { userId, username: state.username, roomId })
+  }
+
+  private emit(event: 'typing:start' | 'typing:stop', data: { userId: string; username: string; roomId: string }): void {
+    // Exclude every socket of the typing user, not just the one that sent the event.
+    this.ns.to(data.roomId).except(userRoom(data.userId)).emit(event, data)
   }
 }
