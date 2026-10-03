@@ -10,6 +10,15 @@ import { randomUUID } from 'crypto'
 
 const DEFAULT_HISTORY_LIMIT = 50
 const DEFAULT_MAX_MESSAGE_LENGTH = 10_000
+/** How many recent messages are remembered in memory to check ownership when there is no persistence adapter. */
+const MAX_TRACKED_MESSAGES = 10_000
+
+interface FoundMessage {
+  roomId: string
+  senderId: string
+  /** The full message, when it came from the persistence adapter. */
+  message?: Message
+}
 
 export interface MessageHandlerConfig {
   maxMessageLength?: number
@@ -43,6 +52,8 @@ export class MessageHandler {
   private readonly handleDelete: (message: Message) => void
   private readonly handleRead: (userId: string, messageId: string, roomId: string) => void
   private readonly handleReaction: (reaction: ReactPayload, message: Message) => void
+  // messageId -> owner; insertion-ordered so the oldest entry is evicted first.
+  private readonly recentMessages = new Map<string, { roomId: string; senderId: string }>()
 
   constructor(deps: MessageHandlerDeps) {
     this.ns = deps.ns
@@ -116,6 +127,7 @@ export class MessageHandler {
       await this.runMiddleware(message, socket)
 
       this.ns.to(roomId).emit('message:new', message)
+      this.trackMessage(message)
 
       if (this.persistence) {
         await this.persistence.saveMessage(message).catch(e => logger.error('persist saveMessage:', e))
@@ -146,31 +158,30 @@ export class MessageHandler {
         throw new ChatError('messageId, roomId and content are required', ErrorCodes.VALIDATION)
       }
 
-      const room = this.roomManager.get(roomId)
-      if (!room) throw new ChatError('Room not found', ErrorCodes.ROOM_NOT_FOUND)
+      this.requireMember(user, roomId)
+      const found = await this.requireMessage(roomId, messageId)
+      if (found.senderId !== user.id) {
+        throw new ChatError("Cannot edit another user's message", ErrorCodes.UNAUTHORIZED)
+      }
 
-      let previousContent = ''
-
+      const editedAt = new Date()
       if (this.persistence) {
-        const messages = await this.persistence.getMessages(roomId)
-        const message = messages.find(m => m.id === messageId)
-        if (message && message.senderId !== user.id) {
-          throw new ChatError("Cannot edit another user's message", ErrorCodes.UNAUTHORIZED)
-        }
-        previousContent = message?.content ?? ''
-        await this.persistence.updateMessage(messageId, { content, editedAt: new Date() })
+        await this.persistence.updateMessage(messageId, { content, editedAt })
       }
 
       this.ns.to(roomId).emit('message:edited', {
         messageId,
         roomId,
         content,
-        editedAt: new Date(),
+        editedAt,
         editedBy: user.id,
       })
 
-      this.handleEdit({ id: messageId, roomId, content } as Message, previousContent)
-      ack({ ok: true, data: { id: messageId, roomId, content } as Message })
+      const edited = found.message
+        ? { ...found.message, content, editedAt }
+        : ({ id: messageId, roomId, senderId: found.senderId, content, editedAt } as Message)
+      this.handleEdit(edited, found.message?.content ?? '')
+      ack({ ok: true, data: edited })
     } catch (err) {
       this.handleError(err, ack)
     }
@@ -193,24 +204,20 @@ export class MessageHandler {
         throw new ChatError('messageId and roomId are required', ErrorCodes.VALIDATION)
       }
 
-      const room = this.roomManager.get(roomId)
-      if (!room) throw new ChatError('Room not found', ErrorCodes.ROOM_NOT_FOUND)
-
-      const isAdmin = this.roomManager.isAdmin(roomId, user.id)
-      let message: Message | undefined = undefined
+      this.requireMember(user, roomId)
+      const found = await this.requireMessage(roomId, messageId)
+      if (found.senderId !== user.id && !this.roomManager.isAdmin(roomId, user.id)) {
+        throw new ChatError("Cannot delete another user's message", ErrorCodes.UNAUTHORIZED)
+      }
 
       if (this.persistence) {
-        const messages = await this.persistence.getMessages(roomId)
-        message = messages.find(m => m.id === messageId)
-        if (message && message.senderId !== user.id && !isAdmin) {
-          throw new ChatError("Cannot delete another user's message", ErrorCodes.UNAUTHORIZED)
-        }
         await this.persistence.deleteMessage(messageId)
       }
+      this.recentMessages.delete(messageId)
 
       this.ns.to(roomId).emit('message:deleted', { messageId, roomId, deletedBy: user.id })
 
-      if (message) this.handleDelete(message)
+      if (found.message) this.handleDelete(found.message)
       ack({ ok: true, data: undefined })
     } catch (err) {
       this.handleError(err, ack)
@@ -223,6 +230,8 @@ export class MessageHandler {
     const user = socket.data.user
     const { messageId, roomId } = data
     if (!messageId || !roomId) return
+    // No ack for read receipts, so invalid ones are dropped silently.
+    if (!this.roomManager.isMember(roomId, user.id)) return
 
     socket.to(roomId).emit('message:read_receipt', {
       messageId,
@@ -255,6 +264,9 @@ export class MessageHandler {
         throw new ChatError('messageId, roomId and emoji are required', ErrorCodes.VALIDATION)
       }
 
+      this.requireMember(user, roomId)
+      const found = await this.requireMessage(roomId, messageId)
+
       this.ns.to(roomId).emit('message:reaction', {
         messageId,
         roomId,
@@ -264,19 +276,14 @@ export class MessageHandler {
         reactedAt: new Date(),
       })
 
-      let message: Message | undefined = undefined
-
-      if (this.persistence) {
-        const messages = await this.persistence.getMessages(roomId)
-        message = messages.find(m => m.id === messageId)
-        if (message) {
-          if (!message.reactions) message.reactions = {}
-          if (!message.reactions[emoji]) message.reactions[emoji] = []
-          const idx = message.reactions[emoji].indexOf(user.id)
-          if (idx === -1) message.reactions[emoji].push(user.id)
-          else message.reactions[emoji].splice(idx, 1)
-          await this.persistence.updateMessage(messageId, { reactions: message.reactions })
-        }
+      const message = found.message
+      if (this.persistence && message) {
+        if (!message.reactions) message.reactions = {}
+        if (!message.reactions[emoji]) message.reactions[emoji] = []
+        const idx = message.reactions[emoji].indexOf(user.id)
+        if (idx === -1) message.reactions[emoji].push(user.id)
+        else message.reactions[emoji].splice(idx, 1)
+        await this.persistence.updateMessage(messageId, { reactions: message.reactions })
       }
 
       this.handleReaction(data, message ?? ({ id: messageId } as Message))
@@ -310,6 +317,42 @@ export class MessageHandler {
       ack({ ok: true, data: messages })
     } catch (err) {
       this.handleError(err, ack)
+    }
+  }
+
+  // ── Permissions ───────────────────────────────────────────────────────────
+
+  private requireMember(user: User, roomId: string): Room {
+    const room = this.roomManager.get(roomId)
+    if (!room) throw new ChatError('Room not found', ErrorCodes.ROOM_NOT_FOUND)
+    if (!room.members.includes(user.id)) throw new ChatError('Not a member of this room', ErrorCodes.UNAUTHORIZED)
+    return room
+  }
+
+  /** Finds a message in `roomId`, from the persistence adapter or (without one) from recently sent messages. */
+  private async requireMessage(roomId: string, messageId: string): Promise<FoundMessage> {
+    if (this.persistence) {
+      const message = this.persistence.getMessage
+        ? await this.persistence.getMessage(messageId)
+        : (await this.persistence.getMessages(roomId)).find((m) => m.id === messageId)
+      if (message) {
+        // The adapter is the source of truth once it knows the message: don't fall back to memory.
+        if (message.roomId !== roomId || message.deletedAt) {
+          throw new ChatError('Message not found', ErrorCodes.MESSAGE_NOT_FOUND)
+        }
+        return { roomId, senderId: message.senderId, message }
+      }
+    }
+    const recent = this.recentMessages.get(messageId)
+    if (recent && recent.roomId === roomId) return recent
+    throw new ChatError('Message not found', ErrorCodes.MESSAGE_NOT_FOUND)
+  }
+
+  private trackMessage(message: Message): void {
+    this.recentMessages.set(message.id, { roomId: message.roomId, senderId: message.senderId })
+    if (this.recentMessages.size > MAX_TRACKED_MESSAGES) {
+      const oldest = this.recentMessages.keys().next().value
+      if (oldest !== undefined) this.recentMessages.delete(oldest)
     }
   }
 
