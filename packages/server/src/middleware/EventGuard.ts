@@ -1,5 +1,5 @@
 import type { ClientToServerEvents } from '@ravex/types'
-import type { TypedSocket } from '../ChatEngine.js'
+import type { ChatEngineOptions, TypedSocket } from '../ChatEngine.js'
 import { ErrorCodes } from '../utils/errors.js'
 import { logger } from '../utils/logger.js'
 
@@ -97,4 +97,37 @@ export const safeListener = <A extends unknown[]>(
       fail(args, err)
     }
   }
+}
+
+type AnyCallback = (...args: unknown[]) => unknown
+
+/**
+ * Wraps an application callback (onMessage, onRead, …) so a synchronous throw or a rejected promise
+ * is logged instead of crashing the process. Callbacks are notifications: their errors never change
+ * what the client receives.
+ */
+export const safeCallback = (name: string, callback: AnyCallback): ((...args: unknown[]) => void) => {
+  const fail = (err: unknown): void => logger.error(`Error in "${name}" callback:`, err)
+  return (...args) => {
+    try {
+      const result = callback(...args)
+      if (typeof (result as PromiseLike<unknown> | undefined)?.then === 'function') {
+        Promise.resolve(result).catch(fail)
+      }
+    } catch (err) {
+      fail(err)
+    }
+  }
+}
+
+const CALLBACKS = ['onMessage', 'onEdit', 'onDelete', 'onRead', 'onReaction', 'onStatusChange'] as const
+
+/** Returns a copy of the options with every application callback wrapped in `safeCallback`. */
+export const guardCallbacks = (options: ChatEngineOptions): ChatEngineOptions => {
+  const guarded: Record<string, unknown> = { ...options }
+  for (const name of CALLBACKS) {
+    const callback = options[name] as AnyCallback | undefined
+    if (callback) guarded[name] = safeCallback(name, callback)
+  }
+  return guarded as ChatEngineOptions
 }

@@ -34,6 +34,20 @@ describe('Robustness: malformed events', () => {
   })
 })
 
+const callbackProbe = fileURLToPath(new URL('./fixtures/callback-errors.mjs', import.meta.url))
+
+describe('Robustness: failing application callbacks', () => {
+  const targets = ['onMessage', 'onEdit', 'onDelete', 'onRead', 'onReaction', 'onStatusChange', 'onStatusChange:away']
+  const cases = targets.flatMap((target) => [[target, 'async'], [target, 'sync']])
+
+  it.each(cases)('does not crash when %s fails (%s)', (target, mode) => {
+    const res = spawnSync(process.execPath, [callbackProbe, target, mode], { encoding: 'utf8', timeout: 15000 })
+    const crash = res.stderr.split('\n').find((line) => /^\w*Error/u.test(line)) ?? ''
+    expect(res.stdout, 'callback was never called').toContain('CALLED')
+    expect(res.stdout, `server crashed: ${crash}`).toContain('ALIVE')
+  })
+})
+
 describe('Robustness: validation responses', () => {
   let server: TestServer
   let client: ChatClient

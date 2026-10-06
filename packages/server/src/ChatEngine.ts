@@ -18,7 +18,7 @@ import type {
 import { RoomManager, type CreateRoomOptions } from './core/RoomManager.js'
 import { UserManager } from './core/UserManager.js'
 import { RateLimiter, type RateLimitConfig } from './middleware/RateLimiter.js'
-import { validateEvents, safeListener } from './middleware/EventGuard.js'
+import { validateEvents, safeListener, guardCallbacks } from './middleware/EventGuard.js'
 import { MessageHandler, type MessageHandlerConfig } from './handlers/MessageHandler.js'
 import { TypingHandler, type TypingConfig } from './handlers/TypingHandler.js'
 import { PresenceHandler, type PresenceConfig } from './handlers/PresenceHandler.js'
@@ -64,12 +64,13 @@ export interface ChatEngineOptions {
   typing?: TypingConfig
   presence?: PresenceConfig
   rateLimit?: RateLimitConfig
-  onMessage?: (message: Message) => void
-  onEdit?: (message: Message, previousContent: string) => void
-  onDelete?: (message: Message) => void
-  onRead?: (userId: string, messageId: string, roomId: string) => void
-  onReaction?: (reaction: ReactPayload, message: Message) => void
-  onStatusChange?: (userId: string, previousStatus: UserStatus) => void
+  // Application callbacks may be sync or async. Errors they throw or reject with are logged and never crash the server.
+  onMessage?: (message: Message) => void | Promise<void>
+  onEdit?: (message: Message, previousContent: string) => void | Promise<void>
+  onDelete?: (message: Message) => void | Promise<void>
+  onRead?: (userId: string, messageId: string, roomId: string) => void | Promise<void>
+  onReaction?: (reaction: ReactPayload, message: Message) => void | Promise<void>
+  onStatusChange?: (userId: string, previousStatus: UserStatus) => void | Promise<void>
 }
 
 export class ChatEngine {
@@ -91,6 +92,7 @@ export class ChatEngine {
    *                  socket.io ServerOptions (CORS, transports, etc.).
    */
   constructor(srv: HttpServerInstance | number | Server, options: ChatEngineOptions = {}) {
+    options = guardCallbacks(options)
     this.server = srv instanceof Server ? srv : new Server(srv as HttpServerInstance, options.socket)
     const nsPath = options.namespace ?? '/'
     this.ns = this.server.of(nsPath) as TypedNamespace
