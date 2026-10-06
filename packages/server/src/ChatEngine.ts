@@ -103,7 +103,7 @@ export class ChatEngine {
       config: options.message ?? {},
       persistence: this.persistence,
       middleware: this.middleware,
-      clearTyping: (userId, roomId) => this.typingHandler.clearForRoom(userId, roomId),
+      clearTyping: (socketId, userId, roomId) => this.typingHandler.clearForSocketInRoom(socketId, userId, roomId),
       onMessage: options.onMessage ?? (() => {}),
       onEdit: options.onEdit ?? (() => {}),
       onDelete: options.onDelete ?? (() => {}),

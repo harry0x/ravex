@@ -24,8 +24,8 @@ export interface MessageHandlerDeps {
   config: MessageHandlerConfig
   persistence: PersistenceAdapter | undefined
   middleware: MessageMiddleware[]
-  /** Clears the sender's typing indicator once their message is about to be broadcast. */
-  clearTyping: (userId: string, roomId: string) => void
+  /** Clears the sending tab's typing state once its message is about to be broadcast. */
+  clearTyping: (socketId: string, userId: string, roomId: string) => void
   onMessage: (message: Message) => void
   onEdit: (message: Message, previousContent: string) => void
   onDelete: (message: Message) => void
@@ -40,7 +40,7 @@ export class MessageHandler {
   private readonly config: MessageHandlerConfig
   private readonly persistence: PersistenceAdapter | undefined
   private readonly middleware: MessageMiddleware[]
-  private readonly clearTyping: (userId: string, roomId: string) => void
+  private readonly clearTyping: (socketId: string, userId: string, roomId: string) => void
   private readonly handleMessage: (message: Message) => void
   private readonly handleEdit: (message: Message, previousContent: string) => void
   private readonly handleDelete: (message: Message) => void
@@ -119,7 +119,7 @@ export class MessageHandler {
 
       await this.runMiddleware(message, socket)
 
-      this.clearTyping(user.id, roomId)
+      this.clearTyping(socket.id, user.id, roomId)
       this.ns.to(roomId).emit('message:new', message)
 
       if (this.persistence) {

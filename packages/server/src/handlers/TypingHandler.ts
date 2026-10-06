@@ -13,10 +13,10 @@ export interface TypingConfig {
 
 interface TypingState {
   username: string
-  /** The socket that last sent typing:start, so closing that tab clears it. */
-  socketId: string
-  lastEvent: number
-  timer: ReturnType<typeof setTimeout>
+  /** When typing:start was last broadcast for this user (the throttle is per user, not per tab). */
+  lastBroadcast: number
+  /** socketId -> auto-clear timer. The user counts as typing while at least one tab is. */
+  sockets: Map<string, ReturnType<typeof setTimeout>>
 }
 
 /** Per-user socket.io room every socket joins, so a user's own tabs can be excluded from broadcasts. */
@@ -42,24 +42,33 @@ export class TypingHandler {
     const room = this.roomManager.get(roomId)
     if (!room || !room.members.includes(user.id)) return
 
-    const now = Date.now()
-    const throttle = this.config.typingThrottle ?? DEFAULT_TYPING_THROTTLE_MS
-    const existing = this.typing.get(roomId)?.get(user.id)
-    if (existing && now - existing.lastEvent < throttle) return
-
-    if (existing) clearTimeout(existing.timer)
-    const timeout = this.config.typingTimeout ?? DEFAULT_TYPING_TIMEOUT_MS
-    const timer = setTimeout(() => {
-      this.clear(roomId, user.id)
-      logger.debug(`Typing auto-cleared: ${user.id} in ${roomId}`)
-    }, timeout)
-
     let roomTyping = this.typing.get(roomId)
     if (!roomTyping) {
       roomTyping = new Map()
       this.typing.set(roomId, roomTyping)
     }
-    roomTyping.set(user.id, { username: user.username, socketId: socket.id, lastEvent: now, timer })
+    let state = roomTyping.get(user.id)
+    const alreadyTyping = state !== undefined
+    if (!state) {
+      state = { username: user.username, lastBroadcast: 0, sockets: new Map() }
+      roomTyping.set(user.id, state)
+    }
+
+    // (Re)arm this tab's own timer, so each tab times out independently.
+    const timeout = this.config.typingTimeout ?? DEFAULT_TYPING_TIMEOUT_MS
+    clearTimeout(state.sockets.get(socket.id))
+    state.sockets.set(
+      socket.id,
+      setTimeout(() => {
+        this.stopSocket(roomId, user.id, socket.id)
+        logger.debug(`Typing auto-cleared: ${user.id} (socket ${socket.id}) in ${roomId}`)
+      }, timeout),
+    )
+
+    const now = Date.now()
+    const throttle = this.config.typingThrottle ?? DEFAULT_TYPING_THROTTLE_MS
+    if (alreadyTyping && now - state.lastBroadcast < throttle) return
+    state.lastBroadcast = now
 
     this.emit('typing:start', { userId: user.id, username: user.username, roomId })
     logger.debug(`Typing start: ${user.id} in ${roomId}`)
@@ -72,20 +81,25 @@ export class TypingHandler {
     const { roomId } = data
     if (!roomId) return
 
-    // Only users that are currently typing (and therefore passed the membership check) can stop.
-    this.clear(roomId, user.id)
+    // Only tabs that are currently typing (and therefore passed the membership check) can stop.
+    this.stopSocket(roomId, user.id, socket.id)
   }
 
-  /** Clears a user's typing state in one room and notifies the room. No-op if they weren't typing. */
+  /** Clears a user's typing state in one room for every tab (e.g. they left or were kicked). */
   clearForRoom(userId: string, roomId: string): void {
     this.clear(roomId, userId)
   }
 
-  /** Clears typing started from a specific socket (e.g. when that tab disconnects). */
+  /** Stops one tab's typing in one room (e.g. it sent a message). The user stops once no tab is typing. */
+  clearForSocketInRoom(socketId: string, userId: string, roomId: string): void {
+    this.stopSocket(roomId, userId, socketId)
+  }
+
+  /** Stops a tab's typing in every room (e.g. it disconnected). Other tabs of the same user keep typing. */
   clearForSocket(socketId: string): void {
     for (const [roomId, roomTyping] of this.typing) {
       for (const [userId, state] of roomTyping) {
-        if (state.socketId === socketId) this.clear(roomId, userId)
+        if (state.sockets.has(socketId)) this.stopSocket(roomId, userId, socketId)
       }
     }
   }
@@ -99,7 +113,9 @@ export class TypingHandler {
   clearRoomSilently(roomId: string): void {
     const roomTyping = this.typing.get(roomId)
     if (!roomTyping) return
-    for (const state of roomTyping.values()) clearTimeout(state.timer)
+    for (const state of roomTyping.values()) {
+      for (const timer of state.sockets.values()) clearTimeout(timer)
+    }
     this.typing.delete(roomId)
   }
 
@@ -107,12 +123,24 @@ export class TypingHandler {
     for (const roomId of [...this.typing.keys()]) this.clearRoomSilently(roomId)
   }
 
+  /** Removes one tab's typing state; emits the user-level typing:stop only when it was the last active tab. */
+  private stopSocket(roomId: string, userId: string, socketId: string): void {
+    const state = this.typing.get(roomId)?.get(userId)
+    const timer = state?.sockets.get(socketId)
+    if (!state || timer === undefined) return
+
+    clearTimeout(timer)
+    state.sockets.delete(socketId)
+    if (state.sockets.size === 0) this.clear(roomId, userId)
+  }
+
+  /** Removes the user's typing state for every tab and notifies the room. No-op if they weren't typing. */
   private clear(roomId: string, userId: string): void {
     const roomTyping = this.typing.get(roomId)
     const state = roomTyping?.get(userId)
     if (!roomTyping || !state) return
 
-    clearTimeout(state.timer)
+    for (const timer of state.sockets.values()) clearTimeout(timer)
     roomTyping.delete(userId)
     if (roomTyping.size === 0) this.typing.delete(roomId)
 

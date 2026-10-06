@@ -127,6 +127,72 @@ describe('Typing Indicators: edge cases', () => {
     await expect(p).resolves.toMatchObject({ userId: 'alice', roomId })
   })
 
+  describe('two tabs typing at once', () => {
+    /** Alice types in tab A, then (after the 300ms default throttle) in tab B. */
+    async function twoTabsTyping(typingTimeout = 5000) {
+      const { a: tabA, b, roomId } = await setup({ typing: { typingTimeout } })
+      const tabB = await connect('alice')
+      const starts = record(b, 'typing:start')
+      tabA.startTyping(roomId)
+      await sleep(350)
+      tabB.startTyping(roomId)
+      await sleep(50)
+      expect(starts).toHaveLength(2)
+      const stops = record(b, 'typing:stop')
+      return { tabA, tabB, b, roomId, stops }
+    }
+
+    it('keeps typing when one active tab disconnects', async () => {
+      const { tabB, roomId, b, stops } = await twoTabsTyping()
+      tabB.disconnect()
+      await sleep(300)
+      expect(stops).toHaveLength(0)
+      // ...and stops once the last active tab disconnects too
+      const p = waitFor(b, 'typing:stop', 500)
+      clients[0].disconnect()
+      await expect(p).resolves.toMatchObject({ userId: 'alice', roomId })
+    })
+
+    it('keeps typing when one active tab calls stopTyping', async () => {
+      const { tabA, tabB, roomId, stops } = await twoTabsTyping()
+      tabB.stopTyping(roomId)
+      await sleep(200)
+      expect(stops).toHaveLength(0)
+      tabA.stopTyping(roomId)
+      await sleep(200)
+      expect(stops).toMatchObject([{ userId: 'alice', roomId }])
+    })
+
+    it('keeps typing when one active tab sends a message', async () => {
+      const { tabA, tabB, roomId, stops } = await twoTabsTyping()
+      await tabB.sendMessage({ roomId, content: 'sent from tab B' })
+      await sleep(200)
+      expect(stops).toHaveLength(0)
+      await tabA.sendMessage({ roomId, content: 'sent from tab A' })
+      await sleep(200)
+      expect(stops).toHaveLength(1)
+    })
+
+    it('stops only when the last active tab times out', async () => {
+      const { tabB, roomId, stops } = await twoTabsTyping(600)
+      // tab A started at t=0 and times out at ~600ms; tab B started at ~350ms, times out at ~950ms
+      await sleep(400) // now ~800ms
+      expect(stops).toHaveLength(0)
+      await sleep(350) // now ~1150ms
+      expect(stops).toMatchObject([{ userId: 'alice', roomId }])
+      tabB.disconnect()
+      await sleep(100)
+      expect(stops).toHaveLength(1)
+    })
+
+    it('clears every tab at once when the user leaves the room', async () => {
+      const { tabA, roomId, stops } = await twoTabsTyping()
+      await tabA.leaveRoom(roomId)
+      await sleep(200)
+      expect(stops).toMatchObject([{ userId: 'alice', roomId }])
+    })
+  })
+
   it('kicking a typing user should clear their indicator immediately', async () => {
     const { a, b, roomId } = await setup({ typing: { typingTimeout: 3000 } })
     a.startTyping(roomId)
