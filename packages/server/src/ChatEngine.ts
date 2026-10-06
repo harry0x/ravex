@@ -171,26 +171,25 @@ export class ChatEngine {
         connectedAt: new Date(),
       })
     } else if (!wasOnline) {
-      // Coming back after being fully disconnected (status was set to 'offline')
-      existing.status = user.status || 'online'
       existing.connectedAt = new Date()
     }
     this.userManager.addSocketId(user.id, socketId)
     if (!wasOnline) {
       this.ns.emit('user:online', { id: user.id, username: user.username })
     }
+    if (existing && !wasOnline) {
+      // Coming back after being fully disconnected: offline -> online through the shared status path,
+      // which broadcasts user:status and calls onStatusChange with the previous status.
+      this.presenceHandler.setStatus(user.id, user.status || 'online')
+    }
   }
 
   private handleDisconnect(userId: string, username: string, socketId: string): void {
     this.userManager.removeSocketId(userId, socketId)
     if (!this.userManager.isConnected(userId)) {
-      const user = this.userManager.get(userId)
-      const lastSeen = new Date()
-      if (user) {
-        user.lastSeen = lastSeen
-        user.status = 'offline'
-        this.userManager.set(userId, user)
-      }
+      // Shared status path: stores 'offline' and lastSeen, broadcasts user:status and calls onStatusChange.
+      this.presenceHandler.setStatus(userId, 'offline')
+      const lastSeen = this.userManager.get(userId)?.lastSeen ?? new Date()
       this.ns.emit('user:offline', { id: userId, username, lastSeen })
       this.typingHandler.clearAll(userId, username)
       this.presenceHandler.clearAll(userId)

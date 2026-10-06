@@ -130,6 +130,67 @@ describe('Presence status on disconnect', () => {
   })
 })
 
+describe('Presence status hook on disconnect/reconnect', () => {
+  /** Records every onStatusChange call as [userId, previous status, status now stored]. */
+  function startWithHook() {
+    const calls: [string, string, string | undefined][] = []
+    return start({
+      onStatusChange: (userId, previous) => {
+        calls.push([userId, previous, server.engine.getUser(userId)?.status])
+      },
+    }).then(() => calls)
+  }
+
+  it('invokes onStatusChange for busy → offline → online', async () => {
+    const calls = await startWithHook()
+    const alice = await connect('alice')
+    const bob = await connect('bob')
+    bob.setStatus('busy')
+    await sleep(50)
+    bob.disconnect()
+    await sleep(100)
+    await connect('bob')
+    await sleep(50)
+    expect(calls.filter(([id]) => id === 'bob')).toEqual([
+      ['bob', 'online', 'busy'],
+      ['bob', 'busy', 'offline'],
+      ['bob', 'offline', 'online'],
+    ])
+    expect(alice.isConnected).toBe(true)
+  })
+
+  it('broadcasts user:status for the offline and online transitions too', async () => {
+    await startWithHook()
+    const alice = await connect('alice')
+    const bob = await connect('bob')
+    const statuses: string[] = []
+    alice.onUserStatus((s) => s.id === 'bob' && statuses.push(s.status))
+    bob.setStatus('busy')
+    await sleep(50)
+    bob.disconnect()
+    await sleep(100)
+    await connect('bob')
+    await sleep(50)
+    expect(statuses).toEqual(['busy', 'offline', 'online'])
+  })
+
+  it('does not invoke onStatusChange when a tab closes but another stays open', async () => {
+    const calls = await startWithHook()
+    const bobTab1 = await connect('bob')
+    await connect('bob')
+    bobTab1.disconnect()
+    await sleep(100)
+    expect(calls).toEqual([])
+  })
+
+  it('does not invoke onStatusChange for a user\'s first connection', async () => {
+    const calls = await startWithHook()
+    await connect('bob')
+    await sleep(50)
+    expect(calls).toEqual([])
+  })
+})
+
 describe('Rate limiter quota', () => {
   it('does not count rejected attempts, so a user is unblocked after the window', async () => {
     await start({ rateLimit: { maxMessages: 2, windowMs: 400 } })
