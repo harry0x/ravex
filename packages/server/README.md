@@ -239,6 +239,7 @@ const client = new ChatClient({ url: 'https://chat.example.com', auth: { token: 
 - Returning `null`/`undefined`, returning a user without a non-empty string `id`, or throwing rejects the connection. The client gets a generic `connect_error` with the message `"Authentication failed"`; the real error is only logged on the server.
 - When `authenticate` is set, any `auth.user` object sent by the client is ignored.
 - **Without `authenticate`, every connection is rejected.**
+- Connections restored by Socket.IO [connection state recovery](https://socket.io/docs/v4/connection-state-recovery) are authenticated again too: the engine sets `connectionStateRecovery.skipMiddlewares` to `false` (also on a Socket.IO server you pass in), holds missed messages back until `authenticate` succeeds, and only replays them for rooms the user is still a member of. If the token now resolves to a different user, the old session's rooms and messages are dropped.
 
 ### Local development
 

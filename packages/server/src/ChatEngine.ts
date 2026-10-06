@@ -23,6 +23,7 @@ import { TypingHandler, type TypingConfig } from './handlers/TypingHandler.js'
 import { PresenceHandler, type PresenceConfig } from './handlers/PresenceHandler.js'
 import { ChatError, ErrorCodes } from './utils/errors.js'
 import { resolveUser, warnAuthConfig, AUTH_FAILED_MESSAGE, type Authenticate, type AuthOptions } from './middleware/Auth.js'
+import { RecoveryGuard } from './middleware/Recovery.js'
 import { logger } from './utils/logger.js'
 
 export interface SocketData {
@@ -137,24 +138,16 @@ export class ChatEngine {
   }
 
   private setupConnection(): void {
+    // Recovered connections (connectionStateRecovery) must be re-authenticated like new ones.
+    const recovery = new RecoveryGuard(this.server, this.ns)
+
     // Decide who the connecting user is before any event handler can run
-    this.ns.use((socket, next) => {
-      resolveUser(socket.handshake, this.auth).then(
-        (user) => {
-          if (!user) return next(new Error(AUTH_FAILED_MESSAGE))
-          socket.data.user = user
-          next()
-        },
-        (err: unknown) => {
-          logger.warn('authenticate() threw, rejecting connection:', err)
-          next(new Error(AUTH_FAILED_MESSAGE))
-        },
-      )
-    })
+    this.ns.use((socket, next) => this.authenticateSocket(recovery, socket, next))
 
     this.ns.on('connection', (socket) => {
       const user = socket.data.user
-      if (!user?.id) {
+      // Defence in depth: never serve a socket that skipped authentication (e.g. options changed at runtime).
+      if (!user?.id || !recovery.isAuthenticated(socket)) {
         socket.disconnect(true)
         return
       }
@@ -179,6 +172,28 @@ export class ChatEngine {
       socket.on('presence:status', (p) => this.presenceHandler.onStatusChange(socket, p))
       socket.on('disconnect', () => this.handleDisconnect(user.id, user.username, socket.id))
     })
+  }
+
+  /** Namespace middleware: resolves the user for a new or recovered connection, or rejects it. */
+  private authenticateSocket(recovery: RecoveryGuard, socket: TypedSocket, next: (err?: Error) => void): void {
+    // A recovered socket comes back with the previous socket.data; remember who it belonged to.
+    const previousUserId = socket.recovered ? socket.data.user?.id : undefined
+    resolveUser(socket.handshake, this.auth).then(
+      (user) => {
+        if (!user) {
+          recovery.reject(socket)
+          return next(new Error(AUTH_FAILED_MESSAGE))
+        }
+        socket.data.user = user
+        recovery.accept(socket, previousUserId === user.id, (roomId) => this.roomManager.isMember(roomId, user.id))
+        next()
+      },
+      (err: unknown) => {
+        logger.warn('authenticate() threw, rejecting connection:', err)
+        recovery.reject(socket)
+        next(new Error(AUTH_FAILED_MESSAGE))
+      },
+    )
   }
 
   private registerUser(user: User, socketId: string): void {
