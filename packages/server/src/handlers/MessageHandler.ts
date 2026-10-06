@@ -125,6 +125,8 @@ export class MessageHandler {
       }
 
       await this.runMiddleware(message, socket)
+      // The sender may have been removed from the room while async middleware ran.
+      this.requireMember(user, roomId)
 
       this.ns.to(roomId).emit('message:new', message)
       this.trackMessage(message)
@@ -158,13 +160,18 @@ export class MessageHandler {
         throw new ChatError('messageId, roomId and content are required', ErrorCodes.VALIDATION)
       }
 
-      this.requireMember(user, roomId)
-      const found = await this.requireMessage(roomId, messageId)
+      const found = await this.requireMemberMessage(user, roomId, messageId)
       if (found.senderId !== user.id) {
         throw new ChatError("Cannot edit another user's message", ErrorCodes.UNAUTHORIZED)
       }
 
+      // Read everything from the stored message before updating it: adapters may return the stored
+      // object itself, which updateMessage then mutates.
       const editedAt = new Date()
+      const previousContent = found.message?.content ?? ''
+      const edited = found.message
+        ? { ...found.message, content, editedAt }
+        : ({ id: messageId, roomId, senderId: found.senderId, content, editedAt } as Message)
       if (this.persistence) {
         await this.persistence.updateMessage(messageId, { content, editedAt })
       }
@@ -177,10 +184,7 @@ export class MessageHandler {
         editedBy: user.id,
       })
 
-      const edited = found.message
-        ? { ...found.message, content, editedAt }
-        : ({ id: messageId, roomId, senderId: found.senderId, content, editedAt } as Message)
-      this.handleEdit(edited, found.message?.content ?? '')
+      this.handleEdit(edited, previousContent)
       ack({ ok: true, data: edited })
     } catch (err) {
       this.handleError(err, ack)
@@ -204,8 +208,7 @@ export class MessageHandler {
         throw new ChatError('messageId and roomId are required', ErrorCodes.VALIDATION)
       }
 
-      this.requireMember(user, roomId)
-      const found = await this.requireMessage(roomId, messageId)
+      const found = await this.requireMemberMessage(user, roomId, messageId)
       if (found.senderId !== user.id && !this.roomManager.isAdmin(roomId, user.id)) {
         throw new ChatError("Cannot delete another user's message", ErrorCodes.UNAUTHORIZED)
       }
@@ -264,8 +267,7 @@ export class MessageHandler {
         throw new ChatError('messageId, roomId and emoji are required', ErrorCodes.VALIDATION)
       }
 
-      this.requireMember(user, roomId)
-      const found = await this.requireMessage(roomId, messageId)
+      const found = await this.requireMemberMessage(user, roomId, messageId)
 
       this.ns.to(roomId).emit('message:reaction', {
         messageId,
@@ -329,19 +331,35 @@ export class MessageHandler {
     return room
   }
 
-  /** Finds a message in `roomId`, from the persistence adapter or (without one) from recently sent messages. */
+  /**
+   * Checks membership, finds the message, then checks membership again: the lookup is async, and the
+   * user may have been kicked (or the room deleted) while it was pending.
+   */
+  private async requireMemberMessage(user: User, roomId: string, messageId: string): Promise<FoundMessage> {
+    this.requireMember(user, roomId)
+    const found = await this.requireMessage(roomId, messageId)
+    this.requireMember(user, roomId)
+    return found
+  }
+
+  /**
+   * Finds a message in `roomId`. With a persistence adapter that implements `getMessage`, the adapter's
+   * answer is final. Otherwise the in-memory record of recently sent messages is used, also as a
+   * fallback for adapters that only offer `getMessages` (which only returns a window of messages).
+   */
   private async requireMessage(roomId: string, messageId: string): Promise<FoundMessage> {
     if (this.persistence) {
       const message = this.persistence.getMessage
         ? await this.persistence.getMessage(messageId)
         : (await this.persistence.getMessages(roomId)).find((m) => m.id === messageId)
       if (message) {
-        // The adapter is the source of truth once it knows the message: don't fall back to memory.
         if (message.roomId !== roomId || message.deletedAt) {
           throw new ChatError('Message not found', ErrorCodes.MESSAGE_NOT_FOUND)
         }
         return { roomId, senderId: message.senderId, message }
       }
+      // A miss from getMessage is definitive (e.g. deleted directly in the database): don't trust the cache.
+      if (this.persistence.getMessage) throw new ChatError('Message not found', ErrorCodes.MESSAGE_NOT_FOUND)
     }
     const recent = this.recentMessages.get(messageId)
     if (recent && recent.roomId === roomId) return recent

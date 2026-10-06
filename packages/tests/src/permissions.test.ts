@@ -285,3 +285,119 @@ describe('Room permissions', () => {
     await expect(alice.deleteRoom(room.id)).resolves.toBeUndefined()
   })
 })
+
+describe('Review follow-ups', () => {
+  it('passes the content from before the edit to onEdit', async () => {
+    const { store } = memoryStore() // returns its stored (mutable) objects, like many real adapters
+    const calls: [string, string][] = []
+    await start({ persistence: store, onEdit: (m, previous) => { calls.push([m.content, previous]) } })
+    const alice = await connect('alice')
+    const room = await alice.createRoom({ type: 'group' })
+    const msg = await alice.sendMessage({ roomId: room.id, content: 'v1' })
+    await alice.editMessage({ messageId: msg.id, roomId: room.id, content: 'v2' })
+    await alice.editMessage({ messageId: msg.id, roomId: room.id, content: 'v3' })
+    expect(calls).toEqual([['v2', 'v1'], ['v3', 'v2']])
+  })
+
+  it.each([
+    ['deleted directly in the database', (messages: Message[]) => { messages.splice(0, 1) }],
+    ['soft-deleted by an adapter that hides deleted messages', (messages: Message[]) => { messages[0].deletedAt = new Date() }],
+  ])('treats a message %s as not found, even if it was sent recently', async (_label, remove) => {
+    const { store, messages } = memoryStore()
+    const getMessage = store.getMessage!
+    store.getMessage = async (id) => {
+      const m = await getMessage(id)
+      return m?.deletedAt ? undefined : m // soft-delete adapters filter deleted messages out
+    }
+    await start({ persistence: store })
+    const alice = await connect('alice')
+    const bob = await connect('bob')
+    const room = await alice.createRoom({ type: 'group', members: ['bob'] })
+    const msg = await alice.sendMessage({ roomId: room.id, content: 'gone soon' })
+    remove(messages)
+    const edits = record(bob, 'message:edited')
+    await expect(alice.editMessage({ messageId: msg.id, roomId: room.id, content: 'ghost' })).rejects.toThrow('Message not found')
+    await expect(alice.deleteMessage(msg.id, room.id)).rejects.toThrow('Message not found')
+    await expect(alice.sendReaction(msg.id, room.id, '👍')).rejects.toThrow('Message not found')
+    await sleep(100)
+    expect(edits).toHaveLength(0)
+  })
+
+  describe('membership is rechecked after an async lookup', () => {
+    /** An adapter whose next getMessage call waits until the test releases it. */
+    function gatedStore() {
+      const { store } = memoryStore()
+      const getMessage = store.getMessage!
+      let gate: { started: () => void; released: Promise<void> } | undefined
+      store.getMessage = async (id) => {
+        const current = gate
+        gate = undefined
+        if (current) {
+          current.started()
+          await current.released
+        }
+        return getMessage(id)
+      }
+      /** Makes the next lookup wait. `started` resolves once it is pending; `release()` lets it finish. */
+      const arm = () => {
+        let started = () => {}
+        let release = () => {}
+        const startedPromise = new Promise<void>((r) => { started = r })
+        gate = { started, released: new Promise<void>((r) => { release = r }) }
+        return { started: startedPromise, release }
+      }
+      return { store, arm }
+    }
+
+    it.each([
+      ['edit', (c: ChatClient, roomId: string, id: string) => c.editMessage({ messageId: id, roomId, content: 'after kick' }), 'message:edited'],
+      ['delete', (c: ChatClient, roomId: string, id: string) => c.deleteMessage(id, roomId), 'message:deleted'],
+      ['react', (c: ChatClient, roomId: string, id: string) => c.sendReaction(id, roomId, '👍'), 'message:reaction'],
+    ] as const)('rejects %s when the user is kicked while the lookup is pending', async (_label, act, event) => {
+      const gate = gatedStore()
+      await start({ persistence: gate.store })
+      const alice = await connect('alice')
+      const bob = await connect('bob')
+      const room = await alice.createRoom({ type: 'group', members: ['bob'] })
+      const bobsMsg = await bob.sendMessage({ roomId: room.id, content: 'mine' })
+      const seen = record(alice, event)
+
+      const lookup = gate.arm()
+      const action = act(bob, room.id, bobsMsg.id)
+      await lookup.started
+      server.engine.kickUser(room.id, 'bob')
+      lookup.release()
+
+      await expect(action).rejects.toThrow('Not a member of this room')
+      await sleep(100)
+      expect(seen).toHaveLength(0)
+    })
+
+    it('rejects a message when the sender is kicked while message middleware is pending', async () => {
+      let releaseMiddleware = () => {}
+      let middlewareStarted = () => {}
+      const started = new Promise<void>((r) => { middlewareStarted = r })
+      await start({
+        messageMiddleware: [
+          (_m, _u, next) => {
+            middlewareStarted()
+            new Promise<void>((r) => { releaseMiddleware = r }).then(() => next())
+          },
+        ],
+      })
+      const alice = await connect('alice')
+      const bob = await connect('bob')
+      const room = await alice.createRoom({ type: 'group', members: ['bob'] })
+      const seen = record(alice, 'message:new')
+
+      const sending = bob.sendMessage({ roomId: room.id, content: 'after kick' })
+      await started
+      server.engine.kickUser(room.id, 'bob')
+      releaseMiddleware()
+
+      await expect(sending).rejects.toThrow('Not a member of this room')
+      await sleep(100)
+      expect(seen).toHaveLength(0)
+    })
+  })
+})
